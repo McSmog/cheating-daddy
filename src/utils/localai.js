@@ -1,5 +1,7 @@
 const fs = require('fs');
 const path = require('path');
+const { getPreferences, getCredentials } = require('../storage');
+const { normalizeEndpoint, requestCompletion } = require('./openai-compatible');
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn } = require('./gemini');
 const {
@@ -23,6 +25,20 @@ let currentSystemPrompt = null;
 let isLocalActive = false;
 let initializationController = null;
 let llamaCacheSnapshot = new Set();
+let remoteConfig = null;
+let whisperLanguage = 'en';
+let sessionController = null;
+let workQueue = Promise.resolve();
+
+function enqueue(task) {
+    const controller = sessionController;
+    const result = workQueue.then(() => {
+        if (!controller || controller.signal.aborted || controller !== sessionController) throw new Error('Session ended');
+        return task();
+    });
+    workQueue = result.catch(() => {});
+    return result;
+}
 
 let isSpeaking = false;
 let speechBuffers = [];
@@ -99,7 +115,7 @@ function processVad(pcm16kBuffer) {
             speechBuffers = [];
             console.log('[LocalAI] Speech ended, accumulated', audioData.length, 'bytes');
             sendToRenderer('update-status', 'Transcribing...');
-            handleSpeechEnd(audioData);
+            enqueue(() => handleSpeechEnd(audioData)).catch(() => {});
             return;
         }
     }
@@ -140,11 +156,14 @@ async function transcribeAudio(pcm16kBuffer) {
     formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'speech.wav');
     formData.append('response_format', 'json');
     formData.append('temperature', '0.0');
-    formData.append('language', 'en');
+    formData.append('language', whisperLanguage);
+    formData.append('translate', 'false');
 
+    const signal = sessionController.signal;
     const response = await fetch(`${whisperBaseUrl}/inference`, {
         method: 'POST',
         body: formData,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
     });
 
     if (!response.ok) {
@@ -152,6 +171,7 @@ async function transcribeAudio(pcm16kBuffer) {
     }
 
     const result = await response.json();
+    signal.throwIfAborted();
     const text = result.text?.trim() || '';
     console.log('[LocalAI] Transcription:', text);
     return text;
@@ -159,6 +179,7 @@ async function transcribeAudio(pcm16kBuffer) {
 
 async function handleSpeechEnd(audioData) {
     if (!isLocalActive) return;
+    const controller = sessionController;
 
     if (audioData.length < 16000) {
         console.log('[LocalAI] Audio too short, skipping');
@@ -179,7 +200,8 @@ async function handleSpeechEnd(audioData) {
         await sendToLlama(transcription);
     } catch (error) {
         console.error('[LocalAI] Transcription error:', error);
-        sendToRenderer('update-status', 'Transcription error: ' + error.message);
+        if (controller === sessionController && isLocalActive && error.name !== 'AbortError')
+            sendToRenderer('update-status', 'Speech/response error: ' + error.message);
     }
 }
 
@@ -212,6 +234,9 @@ async function readStreamingResponse(response, onText) {
 }
 
 async function requestLlama(messages, onText) {
+    if (remoteConfig) {
+        return requestCompletion(remoteConfig, messages, onText, sessionController.signal);
+    }
     if (!llamaBaseUrl) {
         throw new Error('Llama server is not running');
     }
@@ -219,6 +244,7 @@ async function requestLlama(messages, onText) {
     const response = await fetch(`${llamaBaseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.any([sessionController.signal, AbortSignal.timeout(120000)]),
         body: JSON.stringify({
             model: 'local',
             messages,
@@ -239,6 +265,7 @@ async function requestLlama(messages, onText) {
 }
 
 async function sendToLlama(transcription) {
+    const controller = sessionController;
     localConversationHistory.push({
         role: 'user',
         content: transcription.trim(),
@@ -253,10 +280,12 @@ async function sendToLlama(transcription) {
 
         let isFirst = true;
         const fullText = await requestLlama(messages, text => {
+            controller.signal.throwIfAborted();
             sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
             isFirst = false;
         });
 
+        controller.signal.throwIfAborted();
         if (fullText.trim()) {
             localConversationHistory.push({
                 role: 'assistant',
@@ -269,7 +298,8 @@ async function sendToLlama(transcription) {
         sendToRenderer('update-status', 'Listening...');
     } catch (error) {
         console.error('[LocalAI] Llama error:', error);
-        sendToRenderer('update-status', 'Local AI error: ' + error.message);
+        if (controller === sessionController && isLocalActive && error.name !== 'AbortError')
+            sendToRenderer('update-status', 'AI error: ' + error.message);
         throw error;
     }
 }
@@ -330,8 +360,8 @@ async function prepareNativeFiles(llamaModelReference, whisperModel, signal) {
         sendDownloadProgress(label, progress);
     };
 
-    sendDownloadProgress('Checking Llama runner');
-    const llamaBinaryPath = await ensureNativeBinary('llama', binaryProgress('Llama runner'), signal);
+    if (!remoteConfig) sendDownloadProgress('Checking Llama runner');
+    const llamaBinaryPath = remoteConfig ? null : await ensureNativeBinary('llama', binaryProgress('Llama runner'), signal);
 
     sendDownloadProgress('Checking Whisper runner');
     const whisperBinaryPath = await ensureNativeBinary('whisper', binaryProgress('Whisper runner'), signal);
@@ -344,6 +374,8 @@ async function prepareNativeFiles(llamaModelReference, whisperModel, signal) {
     } finally {
         sendToRenderer('whisper-downloading', false);
     }
+
+    if (remoteConfig) return { whisperBinaryPath, whisperModelPath };
 
     sendDownloadProgress('Checking language model');
     const llamaFiles = await ensureLlamaModel(llamaModelReference, binaryProgress('Language model'), binaryProgress('Vision model'), signal);
@@ -365,7 +397,7 @@ function validatePreparedNativeFiles(nativeFiles) {
         ['Vision model', nativeFiles.projectorPath],
     ];
 
-    for (const [label, filePath] of requiredFiles) {
+    for (const [label, filePath] of requiredFiles.filter(([label]) => !remoteConfig || label.startsWith('Whisper'))) {
         if (!filePath || !fs.existsSync(filePath)) {
             throw new Error(`${label} path is invalid: ${filePath}`);
         }
@@ -423,15 +455,28 @@ async function startLlamaServer(executablePath, modelPath, projectorPath) {
 }
 
 async function initializeLocalSession(model, whisperModel, profile, customPrompt) {
+    if (initializationController) return false;
     console.log('[LocalAI] Initializing native local session:', { model, whisperModel, profile });
     sendToRenderer('session-initializing', true);
 
     try {
         closeLocalSession();
-        initializationController = new AbortController();
+        if ([model, whisperModel, profile, customPrompt].some(value => typeof value !== 'string')) throw new Error('Invalid session settings');
+        const prefs = getPreferences();
+        if (prefs.localResponseBackend === 'openai') {
+            const endpoint = normalizeEndpoint(prefs.openaiBaseUrl);
+            if (typeof prefs.openaiModel !== 'string' || !prefs.openaiModel.trim()) throw new Error('Enter an API model name');
+            remoteConfig = { endpoint, model: prefs.openaiModel.trim(), apiKey: getCredentials().openaiKey || '' };
+        }
+        whisperLanguage = prefs.whisperLanguage || (whisperModel.endsWith('.en') ? 'en' : 'auto');
+        if (!/^(auto|[a-z]{2,3})$/.test(whisperLanguage)) throw new Error('Invalid Whisper language');
+        if (whisperModel.endsWith('.en') && whisperLanguage !== 'en')
+            throw new Error('Choose a multilingual Whisper model for Russian or automatic language detection');
+        sessionController = new AbortController();
+        initializationController = sessionController;
         llamaCacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
         currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
-        llamaModel = model;
+        llamaModel = remoteConfig?.model || model;
 
         const nativeFiles = await prepareNativeFiles(model, whisperModel, initializationController.signal);
         validatePreparedNativeFiles(nativeFiles);
@@ -440,9 +485,12 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
         sendDownloadProgress('Starting Whisper');
         await startWhisperServer(nativeFiles.whisperBinaryPath, nativeFiles.whisperModelPath);
 
-        sendToRenderer('update-status', 'Loading local language model...');
-        sendDownloadProgress('Loading language model');
-        await startLlamaServer(nativeFiles.llamaBinaryPath, nativeFiles.llamaModelPath, nativeFiles.projectorPath);
+        if (!remoteConfig) {
+            sendToRenderer('update-status', 'Loading local language model...');
+            sendDownloadProgress('Loading language model');
+            await startLlamaServer(nativeFiles.llamaBinaryPath, nativeFiles.llamaModelPath, nativeFiles.projectorPath);
+        }
+        sessionController.signal.throwIfAborted();
 
         isSpeaking = false;
         speechBuffers = [];
@@ -488,6 +536,10 @@ function processLocalAudio(monoChunk24k) {
 
 function closeLocalSession() {
     isLocalActive = false;
+    sessionController?.abort();
+    sessionController = null;
+    workQueue = Promise.resolve();
+    remoteConfig = null;
     initializationController?.abort();
     initializationController = null;
     stopNativeServer(llamaProcess);
@@ -526,23 +578,24 @@ function isLocalSessionActive() {
 }
 
 async function sendLocalText(text) {
-    if (!isLocalActive || !llamaProcess) {
+    if (!isLocalActive || (!llamaProcess && !remoteConfig)) {
         return { success: false, error: 'No active local session' };
     }
 
     try {
-        await sendToLlama(text);
+        await enqueue(() => sendToLlama(text));
         return { success: true };
     } catch (error) {
         return { success: false, error: error.message };
     }
 }
 
-async function sendLocalImage(base64Data, prompt) {
-    if (!isLocalActive || !llamaProcess) {
+async function generateLocalImage(base64Data, prompt) {
+    if (!isLocalActive || (!llamaProcess && !remoteConfig)) {
         return { success: false, error: 'No active local session' };
     }
 
+    const controller = sessionController;
     const userMessage = {
         role: 'user',
         content: [
@@ -571,10 +624,12 @@ async function sendLocalImage(base64Data, prompt) {
 
         let isFirst = true;
         const fullText = await requestLlama(messages, text => {
+            controller.signal.throwIfAborted();
             sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
             isFirst = false;
         });
 
+        controller.signal.throwIfAborted();
         if (fullText.trim()) {
             localConversationHistory.push({ role: 'assistant', content: fullText.trim() });
             saveConversationTurn(prompt, fullText);
@@ -584,7 +639,8 @@ async function sendLocalImage(base64Data, prompt) {
         return { success: true, text: fullText, model: llamaModel };
     } catch (error) {
         console.error('[LocalAI] Image error:', error);
-        sendToRenderer('update-status', 'Local AI image error: ' + error.message);
+        if (controller === sessionController && isLocalActive && error.name !== 'AbortError')
+            sendToRenderer('update-status', 'Image error: ' + error.message);
         return { success: false, error: error.message };
     }
 }
@@ -596,5 +652,6 @@ module.exports = {
     closeLocalSession,
     isLocalSessionActive,
     sendLocalText,
-    sendLocalImage,
+    sendLocalImage: (base64Data, prompt) =>
+        enqueue(() => generateLocalImage(base64Data, prompt)).catch(error => ({ success: false, error: error.message })),
 };

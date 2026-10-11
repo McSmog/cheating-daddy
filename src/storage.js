@@ -33,7 +33,11 @@ const DEFAULT_PREFERENCES = {
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
-    whisperModel: 'tiny.en',
+    whisperModel: 'base',
+    whisperLanguage: '',
+    localResponseBackend: 'local',
+    openaiBaseUrl: '',
+    openaiModel: '',
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults

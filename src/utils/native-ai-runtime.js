@@ -47,6 +47,22 @@ const BINARY_RELEASES = {
 };
 
 const WHISPER_MODELS = {
+    tiny: {
+        filename: 'ggml-tiny.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin',
+        sha256: 'be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21',
+    },
+    base: {
+        filename: 'ggml-base.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+        sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe',
+    },
+    small: {
+        filename: 'ggml-small.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
+        sha256: '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b',
+    },
+
     'tiny.en': {
         filename: 'ggml-tiny.en.bin',
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin',

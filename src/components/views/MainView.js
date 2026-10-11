@@ -708,6 +708,10 @@ export class MainView extends LitElement {
         _localLlmModel: { state: true },
         _useCustomLocalLlmModel: { state: true },
         _whisperModel: { state: true },
+        _responseBackend: { state: true },
+        _apiBaseUrl: { state: true },
+        _apiModel: { state: true },
+        _whisperLanguage: { state: true },
         _showLocalHelp: { state: true },
     };
 
@@ -736,7 +740,11 @@ export class MainView extends LitElement {
         this._showLocalHelp = false;
         this._localLlmModel = 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M';
         this._useCustomLocalLlmModel = false;
-        this._whisperModel = 'tiny.en';
+        this._whisperModel = 'base';
+        this._responseBackend = 'local';
+        this._apiBaseUrl = '';
+        this._apiModel = '';
+        this._whisperLanguage = 'auto';
 
         this._animId = null;
         this._time = 0;
@@ -775,7 +783,11 @@ export class MainView extends LitElement {
             // Load local AI settings
             this._localLlmModel = prefs.localLlmModel || 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M';
             this._useCustomLocalLlmModel = !LOCAL_LLM_PRESETS.some(preset => preset.value === this._localLlmModel);
-            this._whisperModel = prefs.whisperModel || 'tiny.en';
+            this._whisperModel = prefs.whisperModel || 'base';
+            this._responseBackend = prefs.localResponseBackend || 'local';
+            this._apiBaseUrl = prefs.openaiBaseUrl || '';
+            this._apiModel = prefs.openaiModel || '';
+            this._whisperLanguage = prefs.whisperLanguage || (this._whisperModel.endsWith('.en') ? 'en' : 'auto');
 
             this.requestUpdate();
         } catch (e) {
@@ -1029,7 +1041,7 @@ export class MainView extends LitElement {
                 return;
             }
         } else if (this._mode === 'local') {
-            if (!this._localLlmModel.trim()) {
+            if (this._responseBackend === 'local' && !this._localLlmModel.trim()) {
                 return;
             }
         }
@@ -1106,29 +1118,25 @@ export class MainView extends LitElement {
             >
                 <canvas class="btn-aurora"></canvas>
                 <canvas class="btn-dither"></canvas>
-                ${
-                    isDownloading
-                        ? html`<span
-                              class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
-                              style=${hasPercentage ? `width: ${percentage}%` : ''}
-                          ></span>`
-                        : ''
-                }
+                ${isDownloading
+                    ? html`<span
+                          class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
+                          style=${hasPercentage ? `width: ${percentage}%` : ''}
+                      ></span>`
+                    : ''}
                 <span class="btn-label">
                     ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : 'Start Session'}
                     ${isDownloading ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
                 </span>
             </button>
-            ${
-                isDownloading
-                    ? html`
-                          <div class="download-controls">
-                              <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
-                              <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
-                          </div>
-                      `
-                    : ''
-            }
+            ${isDownloading
+                ? html`
+                      <div class="download-controls">
+                          <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
+                          <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
+                      </div>
+                  `
+                : ''}
         `;
     }
 
@@ -1238,12 +1246,52 @@ export class MainView extends LitElement {
             <!-- Cloud promo intentionally removed from the active UI. -->
 
             <div class="mode-links">
-                <button class="mode-link" @click=${() => this._saveMode('local')}>Use local AI</button>
+                <button class="mode-link" @click=${() => this._saveMode('local')}>Use Whisper + local model or API</button>
             </div>
         `;
     }
 
     // ── Local AI mode ──
+
+    async _saveWhisperApiSetting(field, key, value) {
+        this[field] = value;
+        await cheatingDaddy.storage.updatePreference(key, value);
+        this.requestUpdate();
+    }
+
+    async _saveCompatibleKey(value) {
+        this._openaiKey = value;
+        await cheatingDaddy.storage.setCredentials({ openaiKey: value });
+    }
+
+    _renderCompatibleApi() {
+        return html`<div class="form-group">
+            <label class="form-label">API base URL</label>
+            <input
+                type="url"
+                placeholder="https://your-provider.example/v1"
+                .value=${this._apiBaseUrl}
+                @input=${e => this._saveWhisperApiSetting('_apiBaseUrl', 'openaiBaseUrl', e.target.value)}
+            />
+            <label class="form-label">API key</label>
+            <input
+                type="password"
+                placeholder="Optional for a local endpoint"
+                .value=${this._openaiKey}
+                @input=${e => this._saveCompatibleKey(e.target.value)}
+            />
+            <label class="form-label">Model ID</label>
+            <input
+                type="text"
+                placeholder="Model name from your provider"
+                .value=${this._apiModel}
+                @input=${e => this._saveWhisperApiSetting('_apiModel', 'openaiModel', e.target.value)}
+            />
+            <div class="form-hint">
+                Speech is transcribed on your computer. Text, context and requested screenshots go to your API. Screenshots require a vision model.
+            </div>
+        </div>`;
+    }
 
     _renderLocalMode() {
         return html`
@@ -1251,33 +1299,43 @@ export class MainView extends LitElement {
                 <summary class="config-summary">
                     <span class="config-summary-text">
                         <span class="config-summary-title">Language model</span>
-                        <span class="config-summary-description">Local GGUF model</span>
+                        <span class="config-summary-description"
+                            >${this._responseBackend === 'openai' ? 'OpenAI-compatible API' : 'Local GGUF model'}</span
+                        >
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
                 <div class="config-content">
                     <div class="form-group">
-                        <label class="form-label">Model</label>
+                        <label class="form-label">Answer provider</label>
                         <select
-                            .value=${this._useCustomLocalLlmModel ? 'custom' : this._localLlmModel}
-                            @change=${event => this._selectLocalLlmModel(event.target.value)}
+                            .value=${this._responseBackend}
+                            @change=${e => this._saveWhisperApiSetting('_responseBackend', 'localResponseBackend', e.target.value)}
                         >
-                            ${LOCAL_LLM_PRESETS.map(preset => html`<option value=${preset.value}>${preset.label}</option>`)}
-                            <option value="custom">Custom Hugging Face model or local GGUF…</option>
+                            <option value="local">Local GGUF model</option>
+                            <option value="openai">OpenAI-compatible API</option>
                         </select>
-                        ${
-                            this._useCustomLocalLlmModel
-                                ? html`
-                                      <input
-                                          type="text"
-                                          placeholder="owner/repository:quant or /absolute/model.gguf"
-                                          .value=${this._localLlmModel}
-                                          @input=${event => this._saveLocalLlmModel(event.target.value)}
-                                      />
-                                  `
-                                : ''
-                        }
-                        <div class="form-hint">Sizes include the vision model. Q4 uses less memory; Q8 preserves more quality.</div>
+                        ${this._responseBackend === 'openai'
+                            ? this._renderCompatibleApi()
+                            : html` <label class="form-label">Model</label>
+                                  <select
+                                      .value=${this._useCustomLocalLlmModel ? 'custom' : this._localLlmModel}
+                                      @change=${event => this._selectLocalLlmModel(event.target.value)}
+                                  >
+                                      ${LOCAL_LLM_PRESETS.map(preset => html`<option value=${preset.value}>${preset.label}</option>`)}
+                                      <option value="custom">Custom Hugging Face model or local GGUF…</option>
+                                  </select>
+                                  ${this._useCustomLocalLlmModel
+                                      ? html`
+                                            <input
+                                                type="text"
+                                                placeholder="owner/repository:quant or /absolute/model.gguf"
+                                                .value=${this._localLlmModel}
+                                                @input=${event => this._saveLocalLlmModel(event.target.value)}
+                                            />
+                                        `
+                                      : ''}
+                                  <div class="form-hint">Sizes include the vision model. Q4 uses less memory; Q8 preserves more quality.</div>`}
                     </div>
                 </div>
             </details>
@@ -1297,9 +1355,21 @@ export class MainView extends LitElement {
                             ${this.whisperDownloading ? html`<div class="whisper-spinner"></div>` : ''}
                         </div>
                         <select .value=${this._whisperModel} @change=${e => this._saveWhisperModel(e.target.value)}>
+                            <option value="tiny">Tiny multilingual (75 MB, fastest)</option>
+                            <option value="base">Base multilingual (142 MB)</option>
+                            <option value="small">Small multilingual (466 MB, better accuracy)</option>
                             <option value="tiny.en" ?selected=${this._whisperModel === 'tiny.en'}>Tiny English (75 MB, fastest)</option>
                             <option value="base.en" ?selected=${this._whisperModel === 'base.en'}>Base English (142 MB)</option>
                             <option value="small.en" ?selected=${this._whisperModel === 'small.en'}>Small English (466 MB, most accurate)</option>
+                        </select>
+                        <label class="form-label">Speech language</label>
+                        <select
+                            .value=${this._whisperLanguage}
+                            @change=${e => this._saveWhisperApiSetting('_whisperLanguage', 'whisperLanguage', e.target.value)}
+                        >
+                            <option value="auto">Detect automatically (multilingual models)</option>
+                            <option value="ru">Russian</option>
+                            <option value="en">English</option>
                         </select>
                         <div class="form-hint">${this.whisperDownloading ? 'Downloading model...' : 'Downloaded automatically on first use'}</div>
                     </div>
@@ -1331,17 +1401,17 @@ export class MainView extends LitElement {
 
         return html`
             <div class="form-wrapper">
-                ${
-                    this._mode === 'local'
-                        ? html`
-                              <div class="title-row">
-                                  <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
-                                  <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
-                              </div>
-                          `
-                        : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `
-                }
-                <div class="page-subtitle">${this._mode === 'byok' ? 'Bring your own API keys' : 'Run models locally on your machine'}</div>
+                ${this._mode === 'local'
+                    ? html`
+                          <div class="title-row">
+                              <div class="page-title">Cheating Daddy <span class="mode-suffix">Whisper</span></div>
+                              <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
+                          </div>
+                      `
+                    : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `}
+                <div class="page-subtitle">
+                    ${this._mode === 'byok' ? 'Bring your own API keys' : 'Local speech recognition, your choice of answer provider'}
+                </div>
 
                 <!-- Cloud mode render branch intentionally disabled. -->
                 ${this._mode === 'byok' ? this._renderByokMode() : ''} ${this._mode === 'local' ? this._renderLocalMode() : ''}
@@ -1363,8 +1433,8 @@ export class MainView extends LitElement {
                         <div class="help-section">
                             <div class="help-section-title">Native local AI</div>
                             <div class="help-section-text">
-                                Cheating Daddy runs llama.cpp and whisper.cpp directly. Everything stays on your computer — no external AI service or
-                                Ollama installation is required.
+                                Whisper runs on your computer. Choose a local GGUF model for offline answers, or an OpenAI-compatible API for hosted
+                                answers. In API mode, only Whisper is downloaded; text and requested screenshots go to your provider.
                             </div>
                         </div>
 

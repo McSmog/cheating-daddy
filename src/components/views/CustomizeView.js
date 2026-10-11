@@ -176,6 +176,10 @@ export class CustomizeView extends LitElement {
     ];
 
     static properties = {
+        _apiBaseUrl: { state: true },
+        _apiModel: { state: true },
+        _apiKey: { state: true },
+        _apiStatus: { state: true },
         selectedProfile: { type: String },
         selectedLanguage: { type: String },
         selectedImageQuality: { type: String },
@@ -197,6 +201,10 @@ export class CustomizeView extends LitElement {
 
     constructor() {
         super();
+        this._apiBaseUrl = '';
+        this._apiModel = '';
+        this._apiKey = '';
+        this._apiStatus = '';
         this.selectedProfile = 'interview';
         this.selectedLanguage = 'en-US';
         this.selectedImageQuality = 'medium';
@@ -226,6 +234,9 @@ export class CustomizeView extends LitElement {
     async _loadFromStorage() {
         try {
             const [prefs, keybinds] = await Promise.all([cheatingDaddy.storage.getPreferences(), cheatingDaddy.storage.getKeybinds()]);
+            this._apiBaseUrl = prefs.openaiBaseUrl || '';
+            this._apiModel = prefs.openaiModel || '';
+            this._apiKey = (await cheatingDaddy.storage.getCredentials()).openaiKey || '';
             this.googleSearchEnabled = prefs.googleSearchEnabled ?? true;
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
@@ -567,6 +578,80 @@ export class CustomizeView extends LitElement {
         }
     }
 
+    async _saveApiField(field, key, value) {
+        this[field] = value;
+        this._apiStatus = '';
+        try {
+            if (key === 'openaiKey') {
+                await cheatingDaddy.storage.setCredentials({ openaiKey: value });
+            } else {
+                await cheatingDaddy.storage.updatePreference(key, value);
+            }
+        } catch {
+            this._apiStatus = 'Could not save API settings. Please try again.';
+        }
+    }
+
+    async _useWhisperApi() {
+        try {
+            await cheatingDaddy.storage.updatePreference('localResponseBackend', 'openai');
+            await cheatingDaddy.storage.updatePreference('providerMode', 'local');
+            this._apiStatus = 'Whisper + API selected. Return to Home to start a new session.';
+        } catch {
+            this._apiStatus = 'Could not select Whisper + API. Please try again.';
+        }
+    }
+
+    renderApiSection() {
+        return html`
+            <section class="surface">
+                <div class="surface-title">OpenAI-compatible API</div>
+                <div class="surface-subtitle">
+                    Local Whisper transcribes speech; your API generates answers. Changes save automatically and apply to the next session.
+                </div>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label class="form-label" for="api-base-url">Base URL</label>
+                        <input
+                            id="api-base-url"
+                            class="control"
+                            type="url"
+                            placeholder="https://your-provider.example/v1"
+                            .value=${this._apiBaseUrl}
+                            @input=${e => this._saveApiField('_apiBaseUrl', 'openaiBaseUrl', e.target.value)}
+                        />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="api-model">Model ID</label>
+                        <input
+                            id="api-model"
+                            class="control"
+                            type="text"
+                            placeholder="Model name from your provider"
+                            .value=${this._apiModel}
+                            @input=${e => this._saveApiField('_apiModel', 'openaiModel', e.target.value)}
+                        />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="api-key">API key</label>
+                        <input
+                            id="api-key"
+                            class="control"
+                            type="password"
+                            autocomplete="off"
+                            placeholder="Optional for a local endpoint"
+                            .value=${this._apiKey}
+                            @input=${e => this._saveApiField('_apiKey', 'openaiKey', e.target.value)}
+                        />
+                    </div>
+                    <div class="form-help">Text, context and requested screenshots are sent to this API. Screenshots require a vision model.</div>
+                    <button class="control" @click=${this._useWhisperApi}>Use Whisper + API</button>
+                    ${this._apiStatus ? html`<div class="form-help" role="status">${this._apiStatus}</div>` : ''}
+                </div>
+            </section>
+        `;
+    }
+
     renderAudioSection() {
         return html`
             <section class="surface">
@@ -580,9 +665,9 @@ export class CustomizeView extends LitElement {
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
-                    ` : ''}
+                    ${this.audioMode !== 'speaker_only'
+                        ? html` <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div> `
+                        : ''}
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>
@@ -662,20 +747,22 @@ export class CustomizeView extends LitElement {
         return html`
             <section class="surface">
                 <div class="surface-title">Keyboard Shortcuts</div>
-                ${this.getKeybindActions().map(action => html`
-                    <div class="keybind-row">
-                        <span class="keybind-name">${action.name}</span>
-                        <input
-                            type="text"
-                            class="control keybind-input"
-                            .value=${this.keybinds[action.key]}
-                            data-action=${action.key}
-                            @keydown=${this.handleKeybindInput}
-                            @focus=${this.handleKeybindFocus}
-                            readonly
-                        />
-                    </div>
-                `)}
+                ${this.getKeybindActions().map(
+                    action => html`
+                        <div class="keybind-row">
+                            <span class="keybind-name">${action.name}</span>
+                            <input
+                                type="text"
+                                class="control keybind-input"
+                                .value=${this.keybinds[action.key]}
+                                data-action=${action.key}
+                                @keydown=${this.handleKeybindInput}
+                                @focus=${this.handleKeybindFocus}
+                                readonly
+                            />
+                        </div>
+                    `
+                )}
                 <div style="margin-top: var(--space-sm);">
                     <button class="control" style="width:auto;padding:8px 10px;" @click=${this.resetKeybinds}>Reset to defaults</button>
                 </div>
@@ -695,9 +782,9 @@ export class CustomizeView extends LitElement {
                         ${this.isClearing ? 'Clearing...' : 'Delete all data'}
                     </button>
                 </div>
-                ${this.clearStatusMessage ? html`
-                    <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div>
-                ` : ''}
+                ${this.clearStatusMessage
+                    ? html` <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div> `
+                    : ''}
             </section>
         `;
     }
@@ -707,11 +794,8 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()}
-                    ${this.renderLanguageSection()}
-                    ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
-                    ${this.renderPrivacySection()}
+                    ${this.renderApiSection()} ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()}
+                    ${this.renderKeyboardSection()} ${this.renderPrivacySection()}
                 </div>
             </div>
         `;
